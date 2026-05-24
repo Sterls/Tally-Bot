@@ -1,29 +1,128 @@
+import time
 import chess
+import chess.polyglot
 
 INF = 10**9
+MATE = 100_000
+MATE_BOUND = MATE - 1000  # |score| > MATE_BOUND indicates a forced mate score
 
 _PIECE_VAL = {
     chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
     chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20_000,
 }
 
+# Tomasz Michniewski piece-square tables, white perspective.
+# Index 0 = A1, 63 = H8 (matches chess.SQUARES). Mirror for black.
+_PST = {
+    chess.PAWN: [
+         0,  0,  0,  0,  0,  0,  0,  0,
+         5, 10, 10,-20,-20, 10, 10,  5,
+         5, -5,-10,  0,  0,-10, -5,  5,
+         0,  0,  0, 20, 20,  0,  0,  0,
+         5,  5, 10, 25, 25, 10,  5,  5,
+        10, 10, 20, 30, 30, 20, 10, 10,
+        50, 50, 50, 50, 50, 50, 50, 50,
+         0,  0,  0,  0,  0,  0,  0,  0,
+    ],
+    chess.KNIGHT: [
+        -50,-40,-30,-30,-30,-30,-40,-50,
+        -40,-20,  0,  5,  5,  0,-20,-40,
+        -30,  5, 10, 15, 15, 10,  5,-30,
+        -30,  0, 15, 20, 20, 15,  0,-30,
+        -30,  5, 15, 20, 20, 15,  5,-30,
+        -30,  0, 10, 15, 15, 10,  0,-30,
+        -40,-20,  0,  0,  0,  0,-20,-40,
+        -50,-40,-30,-30,-30,-30,-40,-50,
+    ],
+    chess.BISHOP: [
+        -20,-10,-10,-10,-10,-10,-10,-20,
+        -10,  5,  0,  0,  0,  0,  5,-10,
+        -10, 10, 10, 10, 10, 10, 10,-10,
+        -10,  0, 10, 10, 10, 10,  0,-10,
+        -10,  5,  5, 10, 10,  5,  5,-10,
+        -10,  0,  5, 10, 10,  5,  0,-10,
+        -10,  0,  0,  0,  0,  0,  0,-10,
+        -20,-10,-10,-10,-10,-10,-10,-20,
+    ],
+    chess.ROOK: [
+          0,  0,  0,  5,  5,  0,  0,  0,
+         -5,  0,  0,  0,  0,  0,  0, -5,
+         -5,  0,  0,  0,  0,  0,  0, -5,
+         -5,  0,  0,  0,  0,  0,  0, -5,
+         -5,  0,  0,  0,  0,  0,  0, -5,
+         -5,  0,  0,  0,  0,  0,  0, -5,
+          5, 10, 10, 10, 10, 10, 10,  5,
+          0,  0,  0,  0,  0,  0,  0,  0,
+    ],
+    chess.QUEEN: [
+        -20,-10,-10, -5, -5,-10,-10,-20,
+        -10,  0,  5,  0,  0,  0,  0,-10,
+        -10,  5,  5,  5,  5,  5,  0,-10,
+          0,  0,  5,  5,  5,  5,  0, -5,
+         -5,  0,  5,  5,  5,  5,  0, -5,
+        -10,  0,  5,  5,  5,  5,  0,-10,
+        -10,  0,  0,  0,  0,  0,  0,-10,
+        -20,-10,-10, -5, -5,-10,-10,-20,
+    ],
+    chess.KING: [
+         20, 30, 10,  0,  0, 10, 30, 20,
+         20, 20,  0,  0,  0,  0, 20, 20,
+        -10,-20,-20,-20,-20,-20,-20,-10,
+        -20,-30,-30,-40,-40,-30,-30,-20,
+        -30,-40,-40,-50,-50,-40,-40,-30,
+        -30,-40,-40,-50,-50,-40,-40,-30,
+        -30,-40,-40,-50,-50,-40,-40,-30,
+        -30,-40,-40,-50,-50,-40,-40,-30,
+    ],
+}
 
-def _order_moves(board: chess.Board, moves):
-    """Recaptures → captures (MVV-LVA) → escapes → quiet moves."""
+EXACT, LOWER, UPPER = 0, 1, 2
+
+
+class _Timeout(Exception):
+    pass
+
+
+def evaluate(board: chess.Board) -> int:
+    """Material + piece-square tables, white-positive. No terminal handling."""
+    score = 0
+    for piece_type, value in _PIECE_VAL.items():
+        if piece_type == chess.KING:
+            continue
+        score += len(board.pieces(piece_type, chess.WHITE)) * value
+        score -= len(board.pieces(piece_type, chess.BLACK)) * value
+    for piece_type, table in _PST.items():
+        for sq in board.pieces(piece_type, chess.WHITE):
+            score += table[sq]
+        for sq in board.pieces(piece_type, chess.BLACK):
+            score -= table[chess.square_mirror(sq)]
+    return score
+
+
+def _terminal_score(board: chess.Board, ply: int) -> int:
+    """Absolute (white-positive) score for a game-over position."""
+    if board.is_checkmate():
+        # board.turn = side that has just been mated (to move with no escape)
+        return -(MATE - ply) if board.turn == chess.WHITE else (MATE - ply)
+    return 0  # stalemate / insufficient material / 50-move / repetition
+
+
+def _order_moves(board, moves, tt_move=None):
+    """TT move → recaptures → captures (MVV-LVA) → escapes → quiet moves."""
     last = board.peek() if board.move_stack else None
     recap_sq = last.to_square if last else None
     opp = not board.turn
 
     def key(move):
+        if tt_move is not None and move == tt_move:
+            return (-1, 0, 0)
         victim = board.piece_at(move.to_square)
         aggressor = board.piece_at(move.from_square)
         agg_val = _PIECE_VAL.get(aggressor.piece_type, 0) if aggressor else 0
-
         if victim:
             vic_val = _PIECE_VAL.get(victim.piece_type, 0)
             tier = 0 if move.to_square == recap_sq else 1
             return (tier, -vic_val, agg_val)
-
         if aggressor and board.is_attacked_by(opp, move.from_square):
             atk_min = min(
                 (_PIECE_VAL.get(board.piece_at(sq).piece_type, 0)
@@ -33,86 +132,153 @@ def _order_moves(board: chess.Board, moves):
             )
             if atk_min < agg_val:
                 return (2, 0, 0)
-
         return (3, 0, 0)
 
     return sorted(moves, key=key)
 
 
-def evaluate(board: chess.Board):
-    if board.is_checkmate():
-        return -INF if board.turn else INF
+def _quiescence(board, alpha, beta, maximizing, eval_fn, ply, deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _Timeout
 
-    if board.is_stalemate():
-        return 0
-
-    values = {
-        chess.PAWN: 100,
-        chess.KNIGHT: 320,
-        chess.BISHOP: 330,
-        chess.ROOK: 500,
-        chess.QUEEN: 900,
-    }
-
-    score = 0
-
-    for piece, value in values.items():
-        score += len(board.pieces(piece, chess.WHITE)) * value
-        score -= len(board.pieces(piece, chess.BLACK)) * value
-
-    return score
-
-
-def alphabeta(board, depth, alpha, beta, maximizing, eval_fn=evaluate):
     if board.is_game_over():
-        return evaluate(board)  # static eval for terminals — checkmate/stalemate values are outside NN range
+        return _terminal_score(board, ply)
 
-    if depth == 0:
-        return eval_fn(board)
+    stand_pat = eval_fn(board)
+    if maximizing:
+        if stand_pat >= beta:
+            return stand_pat
+        alpha = max(alpha, stand_pat)
+    else:
+        if stand_pat <= alpha:
+            return stand_pat
+        beta = min(beta, stand_pat)
+
+    captures = [m for m in board.legal_moves if board.is_capture(m)]
+    for move in _order_moves(board, captures):
+        board.push(move)
+        try:
+            val = _quiescence(board, alpha, beta, not maximizing, eval_fn, ply + 1, deadline)
+        finally:
+            board.pop()
+        if maximizing:
+            if val >= beta:
+                return val
+            alpha = max(alpha, val)
+        else:
+            if val <= alpha:
+                return val
+            beta = min(beta, val)
+    return alpha if maximizing else beta
+
+
+def _alphabeta(board, depth, alpha, beta, maximizing, eval_fn, ply, tt, deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _Timeout
+
+    if board.is_game_over():
+        return _terminal_score(board, ply), None
+
+    key = chess.polyglot.zobrist_hash(board)
+    tt_move = None
+    entry = tt.get(key) if tt is not None else None
+    if entry is not None:
+        ent_depth, ent_value, ent_flag, ent_move = entry
+        tt_move = ent_move
+        if ent_depth >= depth:
+            if ent_flag == EXACT:
+                return ent_value, ent_move
+            if ent_flag == LOWER and ent_value >= beta:
+                return ent_value, ent_move
+            if ent_flag == UPPER and ent_value <= alpha:
+                return ent_value, ent_move
+
+    if depth <= 0:
+        return _quiescence(board, alpha, beta, maximizing, eval_fn, ply, deadline), None
+
+    orig_alpha, orig_beta = alpha, beta
+    best_move_local = None
 
     if maximizing:
         best = -INF
-        for move in _order_moves(board, board.legal_moves):
+        for move in _order_moves(board, board.legal_moves, tt_move):
             board.push(move)
-            val = alphabeta(board, depth - 1, alpha, beta, False, eval_fn)
-            board.pop()
-
-            best = max(best, val)
+            try:
+                val, _ = _alphabeta(board, depth - 1, alpha, beta, False,
+                                    eval_fn, ply + 1, tt, deadline)
+            finally:
+                board.pop()
+            if val > best:
+                best = val
+                best_move_local = move
             alpha = max(alpha, val)
-
-            if beta <= alpha:
+            if alpha >= beta:
                 break
-
-        return best
-
     else:
         best = INF
-        for move in _order_moves(board, board.legal_moves):
+        for move in _order_moves(board, board.legal_moves, tt_move):
             board.push(move)
-            val = alphabeta(board, depth - 1, alpha, beta, True, eval_fn)
-            board.pop()
-
-            best = min(best, val)
+            try:
+                val, _ = _alphabeta(board, depth - 1, alpha, beta, True,
+                                    eval_fn, ply + 1, tt, deadline)
+            finally:
+                board.pop()
+            if val < best:
+                best = val
+                best_move_local = move
             beta = min(beta, val)
-
             if beta <= alpha:
                 break
 
-        return best
+    if tt is not None:
+        if best <= orig_alpha:
+            flag = UPPER
+        elif best >= orig_beta:
+            flag = LOWER
+        else:
+            flag = EXACT
+        tt[key] = (depth, best, flag, best_move_local)
+
+    return best, best_move_local
 
 
-def best_move(board, depth=3, eval_fn=evaluate):
-    maximizing = board.turn == chess.WHITE
-    best = None
-    best_value = -(INF + 1) if maximizing else (INF + 1)
+def best_move(board, depth=3, eval_fn=evaluate, tt=None):
+    """Iterative deepening alpha-beta up to `depth`."""
+    if board.is_game_over():
+        return None
+    if tt is None:
+        tt = {}
+    move = None
+    for d in range(1, depth + 1):
+        _, move = _alphabeta(board, d, -INF, INF,
+                             board.turn == chess.WHITE, eval_fn, 0, tt, deadline=None)
+    return move
 
-    for move in _order_moves(board, board.legal_moves):
-        board.push(move)
-        val = alphabeta(board, depth - 1, -INF, INF, not maximizing, eval_fn)
-        board.pop()
 
-        if maximizing and val > best_value or not maximizing and val < best_value:
-            best_value = val
-            best = move
+def best_move_timed(board, think_ms, eval_fn=evaluate, max_depth=64, tt=None):
+    """Iterative deepening with a wall-clock deadline. Depth 1 always completes."""
+    if board.is_game_over():
+        return None
+    if tt is None:
+        tt = {}
+    deadline = time.monotonic() + think_ms / 1000
 
-    return best
+    # Depth 1 uninterruptible — guarantees a thought-through move under time pressure.
+    _, best = _alphabeta(board, 1, -INF, INF,
+                         board.turn == chess.WHITE, eval_fn, 0, tt, deadline=None)
+    last_depth = 1
+
+    for d in range(2, max_depth + 1):
+        if time.monotonic() >= deadline:
+            break
+        try:
+            _, move = _alphabeta(board, d, -INF, INF,
+                                 board.turn == chess.WHITE, eval_fn, 0, tt, deadline)
+            if move is not None:
+                best = move
+                last_depth = d
+        except _Timeout:
+            break
+
+    print(f"  [ab depth={last_depth} budget={think_ms}ms]")
+    return best or next(iter(board.legal_moves), None)

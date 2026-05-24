@@ -1,8 +1,9 @@
 from datetime import timedelta
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
+import chess
 import pytest
 
-from lichess.bot import _to_ms, _pick_depth, GAME_OVER_STATUSES, LichessBot
+from lichess.bot import _to_ms, _think_time_ms, GAME_OVER_STATUSES, LichessBot
 
 
 # --- _to_ms ---
@@ -17,25 +18,23 @@ def test_to_ms_timedelta_partial():
     assert _to_ms(timedelta(seconds=9, milliseconds=500)) == 9_500
 
 
-# --- _pick_depth ---
+# --- _think_time_ms ---
 
-def test_pick_depth_low_time():
-    assert _pick_depth(5_000) == 1
+def test_think_time_clamped_lower():
+    # With near-zero clock, must still return at least the 100ms floor.
+    assert _think_time_ms(0, 1) == 100
 
-def test_pick_depth_medium_time():
-    assert _pick_depth(15_000) == 2
+def test_think_time_clamped_upper():
+    # With huge clock, must not exceed the 5000ms ceiling.
+    assert _think_time_ms(10_000_000, 1) == 5_000
 
-def test_pick_depth_full_time():
-    assert _pick_depth(180_000) == 2
-
-def test_pick_depth_boundary_10s():
-    assert _pick_depth(10_000) == 2   # exactly 10s is NOT under 10s
-
-def test_pick_depth_boundary_9999ms():
-    assert _pick_depth(9_999) == 1
+def test_think_time_scales_with_clock():
+    early = _think_time_ms(60_000, 1)
+    late = _think_time_ms(60_000, 40)
+    assert early < late   # fewer moves remaining → larger per-move budget
 
 
-# --- play_game: game-over handling ---
+# --- play_game ---
 
 def _make_bot():
     with patch("lichess.bot.berserk.Client") as mock_client_cls:
@@ -49,10 +48,8 @@ def _make_bot():
 
 
 def test_play_game_stops_on_outoftime():
-    """Bot must not call make_move after receiving a game-over status."""
     bot, client = _make_bot()
 
-    # Bot is black; first state is white to move (bot skips), second is outoftime
     states = [
         {
             "type": "gameFull",
@@ -94,10 +91,8 @@ def test_play_game_stops_on_mate():
 
 
 def test_play_game_skips_opponents_turn():
-    """Bot should not move when it is the opponent's turn."""
     bot, client = _make_bot()
 
-    # Bot is black; starting position is white to move → bot should skip
     states = [
         {
             "type": "gameFull",
@@ -114,11 +109,8 @@ def test_play_game_skips_opponents_turn():
 
 
 def test_play_game_makes_move_on_our_turn():
-    """Bot must call make_move when it is the bot's turn."""
     bot, client = _make_bot()
-    bot.model = None  # uses alpha-beta fallback
 
-    # Bot is white; starting position is white to move
     states = [
         {
             "type": "gameFull",
@@ -133,16 +125,42 @@ def test_play_game_makes_move_on_our_turn():
 
     client.bots.make_move.assert_called_once()
     move_uci = client.bots.make_move.call_args[0][1]
-    # Must be a legal UCI move from the starting position
-    import chess
+    assert chess.Move.from_uci(move_uci) in chess.Board().legal_moves
+
+
+def test_play_game_incremental_board_after_opponent_move():
+    """Second gameState carries the full move history; bot must respond from that position."""
+    bot, client = _make_bot()
+
+    states = [
+        {
+            "type": "gameFull",
+            "white": {"id": "opponent"},
+            "black": {"id": "testbot"},
+            "state": {"moves": "", "status": "started", "wtime": 180_000, "btime": 180_000},
+        },
+        {
+            "type": "gameState",
+            "moves": "e2e4",  # opponent (white) played e4 → bot (black) must respond
+            "status": "started",
+            "wtime": 180_000,
+            "btime": 180_000,
+        },
+    ]
+    client.bots.stream_game_state.return_value = iter(states)
+
+    bot.play_game("abc123")
+
+    client.bots.make_move.assert_called_once()
+    move_uci = client.bots.make_move.call_args[0][1]
+    # Bot's reply must be legal after 1.e4.
     board = chess.Board()
+    board.push_uci("e2e4")
     assert chess.Move.from_uci(move_uci) in board.legal_moves
 
 
 def test_play_game_make_move_error_does_not_crash():
-    """A ResponseError from make_move must not propagate."""
     bot, client = _make_bot()
-    bot.model = None
 
     states = [
         {

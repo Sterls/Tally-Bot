@@ -1,6 +1,7 @@
+import threading
 import chess
 import berserk
-from engine.search import best_move as alphabeta_best_move, evaluate
+from engine.search import best_move_timed as ab_best_move_timed, evaluate
 
 GAME_OVER_STATUSES = {"mate", "resign", "stalemate", "timeout", "draw",
                       "outoftime", "cheat", "noStart", "unknownFinish", "aborted"}
@@ -16,15 +17,6 @@ def _think_time_ms(my_time_ms: int, fullmove_number: int) -> int:
     moves_left = max(15, 50 - fullmove_number)
     budget = my_time_ms / moves_left * 0.9
     return int(min(max(budget, 100), 5_000))
-
-
-def _pick_depth(my_time_ms: int) -> int:
-    """Fallback depth for alpha-beta when no model is loaded."""
-    if my_time_ms < 10_000:
-        return 1
-    if my_time_ms < 50_000:
-        return 3
-    return 5
 
 
 class LichessBot:
@@ -46,12 +38,20 @@ class LichessBot:
                     print("Accepted challenge", challenge_id)
                 except berserk.exceptions.ResponseError as e:
                     print("Could not accept challenge:", e)
-                    self.client.bots.decline_challenge(challenge_id)
+                    try:
+                        self.client.bots.decline_challenge(challenge_id)
+                    except berserk.exceptions.ResponseError:
+                        pass
 
             elif event["type"] == "gameStart":
                 game_id = event["game"]["id"]
                 print("Game started:", game_id)
-                self.play_game(game_id)
+                threading.Thread(
+                    target=self._safe_play_game,
+                    args=(game_id,),
+                    daemon=True,
+                    name=f"game-{game_id}",
+                ).start()
 
     def challenge_bots(self, n: int):
         sent = 0
@@ -72,28 +72,36 @@ class LichessBot:
             except berserk.exceptions.ResponseError as e:
                 print(f"Could not challenge {bot['id']}:", e)
 
-    def _pick_move(self, board: chess.Board, my_time_ms: int):
+    def _pick_move(self, board: chess.Board, my_time_ms: int, tt: dict):
+        think_ms = _think_time_ms(my_time_ms, board.fullmove_number)
         if self.model is not None:
-            from engine.mcts import best_move_timed
-            think_ms = _think_time_ms(my_time_ms, board.fullmove_number)
-            return best_move_timed(board, self.model, think_ms)
-        depth = _pick_depth(my_time_ms)
-        return alphabeta_best_move(board, depth=depth, eval_fn=evaluate)
+            from engine.mcts import best_move_timed as mcts_best_move_timed
+            return mcts_best_move_timed(board, self.model, think_ms)
+        return ab_best_move_timed(board, think_ms, eval_fn=evaluate, tt=tt)
+
+    def _safe_play_game(self, game_id: str):
+        try:
+            self.play_game(game_id)
+        except Exception as e:
+            print(f"[{game_id}] game loop crashed: {e}")
 
     def play_game(self, game_id: str):
         is_white = None
         my_time_ms = 180_000
+        board = chess.Board()
+        last_move_count = 0
+        tt: dict = {}
 
         for state in self.client.bots.stream_game_state(game_id):
 
             if state["type"] == "gameFull":
                 is_white = (state["white"]["id"] == self.my_id)
-                moves = state["state"]["moves"]
+                moves_str = state["state"]["moves"]
                 status = state["state"].get("status", "started")
                 my_time_ms = _to_ms(state["state"]["wtime" if is_white else "btime"])
 
             elif state["type"] == "gameState":
-                moves = state["moves"]
+                moves_str = state["moves"]
                 status = state.get("status", "started")
                 if is_white is not None:
                     my_time_ms = _to_ms(state["wtime" if is_white else "btime"])
@@ -102,26 +110,28 @@ class LichessBot:
                 continue
 
             if status in GAME_OVER_STATUSES:
-                print(f"Game over: {status}")
+                print(f"[{game_id}] Game over: {status}")
                 break
 
-            board = chess.Board()
-            if moves:
-                for m in moves.split():
-                    board.push_uci(m)
+            all_moves = moves_str.split() if moves_str else []
+            if len(all_moves) < last_move_count:
+                # Resync (takeback or out-of-order reconnect)
+                board = chess.Board()
+                last_move_count = 0
+            for m in all_moves[last_move_count:]:
+                board.push_uci(m)
+            last_move_count = len(all_moves)
 
-            if is_white is None:
+            if is_white is None or board.turn != is_white:
                 continue
 
-            if board.turn != is_white:
+            move = self._pick_move(board, my_time_ms, tt)
+            if not move:
                 continue
 
-            move = self._pick_move(board, my_time_ms)
-
-            if move:
-                print(f"Playing: {move.uci()}  (time={my_time_ms//1000}s)")
-                try:
-                    self.client.bots.make_move(game_id, move.uci())
-                except Exception as e:
-                    print(f"make_move failed: {e}")
-                    break
+            print(f"[{game_id}] Playing: {move.uci()}  (time={my_time_ms//1000}s)")
+            try:
+                self.client.bots.make_move(game_id, move.uci())
+            except Exception as e:
+                print(f"[{game_id}] make_move failed: {e}")
+                break
