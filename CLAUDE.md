@@ -31,7 +31,7 @@ The bot connects to Lichess via the [berserk](https://github.com/lichess-org/ber
 - `play_game(game_id)`: reconstructs the full board from the UCI move history on every state update, then calls the engine on the bot's turn
 
 **`engine/search.py`** — the chess engine
-- `evaluate(board)`: pure static eval — material + piece-square tables, white-positive. **No terminal handling**; callers must check `board.is_game_over()` first if they care about mate/draw scores.
+- `evaluate(board)`: pure static eval — material + tapered MG/EG piece-square tables, white-positive. **No terminal handling**; callers must check `board.is_game_over()` first if they care about mate/draw scores. Phase is computed from non-pawn material weights (`_PHASE_WEIGHT`, max `_TOTAL_PHASE = 24`); the score interpolates `_PST_MG` (castled king, central pieces) toward `_PST_EG` (centralized king, advanced pawns) as material comes off.
 - `best_move(board, depth=3, tt=None)`: iterative-deepening alpha-beta up to `depth`. Always returns a legal move (or `None` if the position is already game-over).
 - `best_move_timed(board, think_ms, tt=None)`: iterative deepening with a wall-clock deadline. Depth 1 always completes, so it returns a thought-through move even under severe time pressure. Pass a persistent `tt` dict across calls in the same game for free move ordering wins.
 - Search internals: transposition table with EXACT/LOWER/UPPER bounds keyed by Zobrist hash; quiescence search at the horizon (captures only); MVV-LVA + TT-move-first move ordering.

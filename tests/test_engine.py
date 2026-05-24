@@ -112,6 +112,21 @@ def test_best_move_timed_respects_tight_budget():
     assert move in board.legal_moves
 
 
+# --- tapered evaluation (MG king prefers safety, EG king prefers center) ---
+
+def test_tapered_eval_king_safety_in_middlegame():
+    # Heavy pieces still on board → middlegame. Castled king (g1) > centralized king (e4).
+    castled = chess.Board("r2qk2r/pppbbppp/2np1n2/4p3/4P3/2NP1N2/PPPBBPPP/R2Q1RK1 w kq - 0 1")
+    exposed = chess.Board("r2q3r/pppbbppp/2np1n2/4p3/4K3/2NP1N2/PPPBBPPP/R2Q3R w kq - 0 1")
+    assert evaluate(castled) > evaluate(exposed)
+
+def test_tapered_eval_king_activity_in_endgame():
+    # Pure K+P endgame → centralized king (e4) > corner king (g1).
+    centered = chess.Board("8/8/8/8/4K3/8/4P3/7k w - - 0 1")
+    cornered = chess.Board("8/8/8/8/8/8/4P3/4K2k w - - 0 1")
+    assert evaluate(centered) > evaluate(cornered)
+
+
 # --- mate-score sanity ---
 
 def test_mate_bound_constants():

@@ -11,9 +11,13 @@ _PIECE_VAL = {
     chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20_000,
 }
 
-# Tomasz Michniewski piece-square tables, white perspective.
-# Index 0 = A1, 63 = H8 (matches chess.SQUARES). Mirror for black.
-_PST = {
+# Piece-square tables, white perspective. Index 0 = A1, 63 = H8 (matches chess.SQUARES).
+# Mirror via chess.square_mirror for black.
+# Two sets: middlegame (MG, Michniewski) and endgame (EG). Interpolated by phase().
+# King PST flips sign between MG (stay castled) and EG (centralize).
+# Pawn PST in EG gives big advancement bonus (passed pawns dominate the endgame).
+
+_PST_MG = {
     chess.PAWN: [
          0,  0,  0,  0,  0,  0,  0,  0,
          5, 10, 10,-20,-20, 10, 10,  5,
@@ -76,6 +80,42 @@ _PST = {
     ],
 }
 
+_PST_EG = {
+    chess.PAWN: [
+          0,   0,   0,   0,   0,   0,   0,   0,
+          5,   5,   5,   5,   5,   5,   5,   5,
+         10,  10,  10,  10,  10,  10,  10,  10,
+         20,  20,  20,  20,  20,  20,  20,  20,
+         35,  35,  35,  35,  35,  35,  35,  35,
+         60,  60,  60,  60,  60,  60,  60,  60,
+        100, 100, 100, 100, 100, 100, 100, 100,
+          0,   0,   0,   0,   0,   0,   0,   0,
+    ],
+    # Knights/bishops/rooks/queens: EG positional preferences resemble MG closely
+    # (central control still good, corners still bad). Reuse MG tables — refining
+    # these is future work, but the framework is in place.
+    chess.KNIGHT: None,  # filled below
+    chess.BISHOP: None,
+    chess.ROOK:   None,
+    chess.QUEEN:  None,
+    chess.KING: [
+        -50,-30,-30,-30,-30,-30,-30,-50,
+        -30,-30,  0,  0,  0,  0,-30,-30,
+        -30,-10, 20, 30, 30, 20,-10,-30,
+        -30,-10, 30, 40, 40, 30,-10,-30,
+        -30,-10, 30, 40, 40, 30,-10,-30,
+        -30,-10, 20, 30, 30, 20,-10,-30,
+        -30,-20,-10,  0,  0,-10,-20,-30,
+        -50,-40,-30,-20,-20,-30,-40,-50,
+    ],
+}
+for _pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
+    _PST_EG[_pt] = _PST_MG[_pt]
+
+# Tapered-eval phase: 24 = full middlegame, 0 = pure endgame (only Ks + pawns).
+_PHASE_WEIGHT = {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}
+_TOTAL_PHASE = 24
+
 EXACT, LOWER, UPPER = 0, 1, 2
 
 
@@ -84,19 +124,26 @@ class _Timeout(Exception):
 
 
 def evaluate(board: chess.Board) -> int:
-    """Material + piece-square tables, white-positive. No terminal handling."""
-    score = 0
-    for piece_type, value in _PIECE_VAL.items():
-        if piece_type == chess.KING:
-            continue
-        score += len(board.pieces(piece_type, chess.WHITE)) * value
-        score -= len(board.pieces(piece_type, chess.BLACK)) * value
-    for piece_type, table in _PST.items():
-        for sq in board.pieces(piece_type, chess.WHITE):
-            score += table[sq]
-        for sq in board.pieces(piece_type, chess.BLACK):
-            score -= table[chess.square_mirror(sq)]
-    return score
+    """Tapered material + PST eval, white-positive. No terminal handling."""
+    mg = 0
+    eg = 0
+    phase = 0
+    for pt in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING):
+        mg_table = _PST_MG[pt]
+        eg_table = _PST_EG[pt]
+        mat = 0 if pt == chess.KING else _PIECE_VAL[pt]
+        pw = _PHASE_WEIGHT.get(pt, 0)
+        for sq in board.pieces(pt, chess.WHITE):
+            mg += mat + mg_table[sq]
+            eg += mat + eg_table[sq]
+            phase += pw
+        for sq in board.pieces(pt, chess.BLACK):
+            mirror = chess.square_mirror(sq)
+            mg -= mat + mg_table[mirror]
+            eg -= mat + eg_table[mirror]
+            phase += pw
+    phase = min(phase, _TOTAL_PHASE)
+    return (mg * phase + eg * (_TOTAL_PHASE - phase)) // _TOTAL_PHASE
 
 
 def _terminal_score(board: chess.Board, ply: int) -> int:
