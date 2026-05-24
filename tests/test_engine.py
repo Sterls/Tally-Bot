@@ -67,6 +67,33 @@ def test_best_move_finds_mate_in_one_for_black():
     assert move == chess.Move.from_uci("a8a1")
 
 
+# --- forced mate sequences (engine plays both sides, must deliver mate) ---
+
+def _play_and_assert_mate(fen: str, depth: int, expected_plies: int):
+    """Engine plays both sides up to expected_plies; assert checkmate is delivered."""
+    board = chess.Board(fen)
+    for _ in range(expected_plies):
+        assert not board.is_game_over(), \
+            f"Game ended early at ply {len(board.move_stack)}: {board.fen()}"
+        move = best_move(board, depth=depth)
+        assert move is not None
+        board.push(move)
+    assert board.is_checkmate(), \
+        f"No mate after {expected_plies} plies; line={[m.uci() for m in board.move_stack]} fen={board.fen()}"
+
+def test_finds_mate_in_two():
+    # Ra3, Rd5, Ke6 vs kh8. Line: 1.Kf7 Kh7 2.Rh5# (verified).
+    _play_and_assert_mate("7k/8/4K3/3R4/8/R7/8/8 w - - 0 1", depth=3, expected_plies=3)
+
+def test_finds_mate_in_three():
+    # K+Q vs k. Line: 1.Ke6 Kf8 2.Qg4 Ke8 3.Qg8# (verified).
+    _play_and_assert_mate("4k3/8/8/4K3/4Q3/8/8/8 w - - 0 1", depth=5, expected_plies=5)
+
+def test_finds_mate_in_four():
+    # K+Q vs k in corner. Line: 1.Kf5 Kh7 2.Kf6 Kg8 3.Qe7 Kh8 4.Qg7# (verified).
+    _play_and_assert_mate("7k/8/8/8/4K3/8/4Q3/8 w - - 0 1", depth=7, expected_plies=7)
+
+
 # --- best_move_timed ---
 
 def test_best_move_timed_returns_legal_move():
