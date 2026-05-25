@@ -4,7 +4,7 @@ import tempfile
 import torch
 
 from nn.model import ChessNet, load as load_model
-from nn.self_play import generate, play_game_vs
+from nn.self_play import generate, play_game_vs, nn_move_fn, engine_move_fn
 from nn.train import train
 from nn import storage
 
@@ -13,27 +13,31 @@ DATA_DIR = "nn/data"
 BEST_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "best.pt")
 
 
-def pit(model_new, model_old, n_games: int = 20, n_simulations: int = 25) -> float:
+def pit_vs_engine(model, n_games: int = 10, n_simulations: int = 15,
+                  engine_depth: int = 3) -> float:
     """
-    Play n_games between new and old model, alternating colors.
-    Returns win rate of new model (wins + 0.5*draws) / n_games.
+    Pit model against the alpha-beta engine, alternating colors.
+    Returns win rate of the NN (wins + 0.5*draws) / n_games.
     """
     wins = draws = losses = 0
+    eng = engine_move_fn(engine_depth)
 
     for i in range(n_games):
+        nn = nn_move_fn(model, n_simulations)
         if i % 2 == 0:
-            outcome = play_game_vs(model_new, model_old, n_simulations)
+            outcome = play_game_vs(nn, eng)
             if outcome > 0:    wins += 1
             elif outcome == 0: draws += 1
             else:              losses += 1
         else:
-            outcome = play_game_vs(model_old, model_new, n_simulations)
+            outcome = play_game_vs(eng, nn)
             if outcome < 0:    wins += 1
             elif outcome == 0: draws += 1
             else:              losses += 1
 
     win_rate = (wins + 0.5 * draws) / n_games
-    print(f"  Pit result: {wins}W {draws}D {losses}L  win_rate={win_rate:.2f}")
+    print(f"  Pit vs engine(d={engine_depth}): {wins}W {draws}D {losses}L  "
+          f"win_rate={win_rate:.2f}")
     return win_rate
 
 
@@ -65,8 +69,9 @@ def run(
     games_per_gen: int = 100,
     epochs_per_gen: int = 10,
     n_simulations: int = 50,
-    pit_games: int = 20,
-    pit_simulations: int = 25,
+    pit_games: int = 10,
+    pit_simulations: int = 15,
+    engine_depth: int = 3,
     promote_threshold: float = 0.55,
     max_positions: int = 200_000,
     force_promote: bool = False,
@@ -95,10 +100,11 @@ def run(
         print(f"Generation {gen}")
         print(f"{'='*50}")
 
-        # 1. Self-play
+        # 1. Self-play vs engine
         data_path = os.path.join(DATA_DIR, f"gen{gen:03d}.pt")
-        print(f"Self-play: {games_per_gen} games, {n_simulations} sims/move")
-        generate(games_per_gen, data_path, current_model, n_simulations)
+        print(f"Self-play vs engine(d={engine_depth}): {games_per_gen} games, "
+              f"{n_simulations} sims/move")
+        generate(games_per_gen, data_path, current_model, n_simulations, engine_depth)
 
         # 2. Rolling window
         _prune_old_data(max_positions)
@@ -119,14 +125,13 @@ def run(
         torch.save(new_model.state_dict(), gen_ckpt)
         print(f"Saved {gen_ckpt}")
 
-        # 4. Pit
+        # 4. Pit vs engine
         new_model = new_model.eval()
         if pit_games == 0:
             promote = True
             print("  Auto-promoting (pit disabled)")
         else:
-            print(f"Pitting new vs current best ({pit_games} games, {pit_simulations} sims)...")
-            win_rate = pit(new_model, current_model, pit_games, pit_simulations)
+            win_rate = pit_vs_engine(new_model, pit_games, pit_simulations, engine_depth)
             promote = force_promote or win_rate >= promote_threshold
 
         # 5. Promote
@@ -153,8 +158,9 @@ if __name__ == "__main__":
     parser.add_argument("--games-per-gen",     type=int,   default=100)
     parser.add_argument("--epochs-per-gen",    type=int,   default=10)
     parser.add_argument("--n-simulations",     type=int,   default=50)
-    parser.add_argument("--pit-games",         type=int,   default=20)
-    parser.add_argument("--pit-simulations",   type=int,   default=25)
+    parser.add_argument("--pit-games",         type=int,   default=10)
+    parser.add_argument("--pit-simulations",   type=int,   default=15)
+    parser.add_argument("--engine-depth",      type=int,   default=3)
     parser.add_argument("--promote-threshold", type=float, default=0.55)
     parser.add_argument("--max-positions",     type=int,   default=200_000)
     parser.add_argument("--force-promote",     action="store_true")
@@ -167,6 +173,7 @@ if __name__ == "__main__":
         n_simulations=args.n_simulations,
         pit_games=args.pit_games,
         pit_simulations=args.pit_simulations,
+        engine_depth=args.engine_depth,
         promote_threshold=args.promote_threshold,
         max_positions=args.max_positions,
         force_promote=args.force_promote,
