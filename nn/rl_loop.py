@@ -11,10 +11,11 @@ from nn import storage
 CHECKPOINT_DIR = "nn/checkpoints"
 DATA_DIR = "nn/data"
 BEST_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "best.pt")
+DEPTH_STATE_FILE = os.path.join(CHECKPOINT_DIR, "engine_depth.txt")
 
 
 def pit_vs_engine(model, n_games: int = 10, n_simulations: int = 15,
-                  engine_depth: int = 3) -> float:
+                  engine_depth: int = 1) -> float:
     """
     Pit model against the alpha-beta engine, alternating colors.
     Returns win rate of the NN (wins + 0.5*draws) / n_games.
@@ -64,14 +65,30 @@ def _prune_old_data(max_positions: int):
         print(f"  Pruned {f}")
 
 
+def _load_depth(default: int) -> int:
+    if os.path.exists(DEPTH_STATE_FILE):
+        with open(DEPTH_STATE_FILE) as f:
+            depth = int(f.read().strip())
+        print(f"Resuming at engine depth {depth}")
+        return depth
+    return default
+
+
+def _save_depth(depth: int):
+    with open(DEPTH_STATE_FILE, "w") as f:
+        f.write(str(depth))
+
+
 def run(
     generations: int = 10,
-    games_per_gen: int = 100,
+    games_per_gen: int = 200,
     epochs_per_gen: int = 10,
     n_simulations: int = 50,
     pit_games: int = 10,
     pit_simulations: int = 15,
-    engine_depth: int = 3,
+    engine_depth: int = 1,
+    max_engine_depth: int = 5,
+    depth_advance_threshold: float = 0.60,
     promote_threshold: float = 0.55,
     max_positions: int = 200_000,
     force_promote: bool = False,
@@ -84,6 +101,7 @@ def run(
     storage.pull(DATA_DIR, "data")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    current_depth = _load_depth(engine_depth)
 
     existing_gens = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "gen*.pt")))
     start_gen = len(existing_gens)
@@ -97,14 +115,14 @@ def run(
 
     for gen in range(start_gen, start_gen + generations):
         print(f"\n{'='*50}")
-        print(f"Generation {gen}")
+        print(f"Generation {gen}  [engine depth {current_depth}]")
         print(f"{'='*50}")
 
         # 1. Self-play vs engine
         data_path = os.path.join(DATA_DIR, f"gen{gen:03d}.pt")
-        print(f"Self-play vs engine(d={engine_depth}): {games_per_gen} games, "
+        print(f"Self-play vs engine(d={current_depth}): {games_per_gen} games, "
               f"{n_simulations} sims/move")
-        generate(games_per_gen, data_path, current_model, n_simulations, engine_depth)
+        generate(games_per_gen, data_path, current_model, n_simulations, current_depth)
 
         # 2. Rolling window
         _prune_old_data(max_positions)
@@ -128,10 +146,11 @@ def run(
         # 4. Pit vs engine
         new_model = new_model.eval()
         if pit_games == 0:
+            win_rate = None
             promote = True
             print("  Auto-promoting (pit disabled)")
         else:
-            win_rate = pit_vs_engine(new_model, pit_games, pit_simulations, engine_depth)
+            win_rate = pit_vs_engine(new_model, pit_games, pit_simulations, current_depth)
             promote = force_promote or win_rate >= promote_threshold
 
         # 5. Promote
@@ -142,7 +161,15 @@ def run(
         else:
             print(f"  Not promoted — keeping previous best")
 
-        # 6. Sync
+        # 6. Advance engine depth if NN is winning consistently
+        if (win_rate is not None
+                and win_rate >= depth_advance_threshold
+                and current_depth < max_engine_depth):
+            current_depth += 1
+            _save_depth(current_depth)
+            print(f"  *** Engine depth advanced to {current_depth} ***")
+
+        # 7. Sync
         print("Syncing to Drive...")
         storage.push(CHECKPOINT_DIR, "checkpoints")
         storage.push(DATA_DIR, "data")
@@ -154,16 +181,18 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--generations",       type=int,   default=10)
-    parser.add_argument("--games-per-gen",     type=int,   default=100)
-    parser.add_argument("--epochs-per-gen",    type=int,   default=10)
-    parser.add_argument("--n-simulations",     type=int,   default=50)
-    parser.add_argument("--pit-games",         type=int,   default=10)
-    parser.add_argument("--pit-simulations",   type=int,   default=15)
-    parser.add_argument("--engine-depth",      type=int,   default=3)
-    parser.add_argument("--promote-threshold", type=float, default=0.55)
-    parser.add_argument("--max-positions",     type=int,   default=200_000)
-    parser.add_argument("--force-promote",     action="store_true")
+    parser.add_argument("--generations",            type=int,   default=10)
+    parser.add_argument("--games-per-gen",          type=int,   default=200)
+    parser.add_argument("--epochs-per-gen",         type=int,   default=10)
+    parser.add_argument("--n-simulations",          type=int,   default=50)
+    parser.add_argument("--pit-games",              type=int,   default=10)
+    parser.add_argument("--pit-simulations",        type=int,   default=15)
+    parser.add_argument("--engine-depth",           type=int,   default=1)
+    parser.add_argument("--max-engine-depth",       type=int,   default=5)
+    parser.add_argument("--depth-advance-threshold",type=float, default=0.60)
+    parser.add_argument("--promote-threshold",      type=float, default=0.55)
+    parser.add_argument("--max-positions",          type=int,   default=200_000)
+    parser.add_argument("--force-promote",          action="store_true")
     args = parser.parse_args()
 
     run(
@@ -174,6 +203,8 @@ if __name__ == "__main__":
         pit_games=args.pit_games,
         pit_simulations=args.pit_simulations,
         engine_depth=args.engine_depth,
+        max_engine_depth=args.max_engine_depth,
+        depth_advance_threshold=args.depth_advance_threshold,
         promote_threshold=args.promote_threshold,
         max_positions=args.max_positions,
         force_promote=args.force_promote,
