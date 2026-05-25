@@ -77,14 +77,16 @@ def run(
     storage.pull(CHECKPOINT_DIR, "checkpoints")
     storage.pull(DATA_DIR, "data")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     existing_gens = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "gen*.pt")))
     start_gen = len(existing_gens)
 
     if os.path.exists(BEST_CHECKPOINT):
-        current_model = load_model(BEST_CHECKPOINT)
+        current_model = load_model(BEST_CHECKPOINT, device=device)
         print(f"Resuming from {BEST_CHECKPOINT}")
     else:
-        current_model = ChessNet().eval()
+        current_model = ChessNet().to(device).eval()
         print("No checkpoint — bootstrapping with random model")
 
     for gen in range(start_gen, start_gen + generations):

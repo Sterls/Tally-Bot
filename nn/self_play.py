@@ -9,7 +9,7 @@ from engine.moves import policy_to_tensor
 from engine import mcts
 from engine.search import evaluate as static_eval
 
-MAX_MOVES = 20
+MAX_MOVES = 200
 TEMP_THRESHOLD = 20  # sample proportionally for first N moves, then argmax
 STATIC_EVAL_SCALE = 600  # centipawns; tanh(600cp/600) ≈ 0.76 for a queen-up position
 
