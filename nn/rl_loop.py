@@ -69,6 +69,7 @@ def run(
     pit_simulations: int = 25,
     promote_threshold: float = 0.55,
     max_positions: int = 200_000,
+    force_promote: bool = False,
 ):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -126,7 +127,7 @@ def run(
         else:
             print(f"Pitting new vs current best ({pit_games} games, {pit_simulations} sims)...")
             win_rate = pit(new_model, current_model, pit_games, pit_simulations)
-            promote = win_rate >= promote_threshold
+            promote = force_promote or win_rate >= promote_threshold
 
         # 5. Promote
         if promote:
@@ -156,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--pit-simulations",   type=int,   default=25)
     parser.add_argument("--promote-threshold", type=float, default=0.55)
     parser.add_argument("--max-positions",     type=int,   default=200_000)
+    parser.add_argument("--force-promote",     action="store_true")
     args = parser.parse_args()
 
     run(
@@ -167,4 +169,5 @@ if __name__ == "__main__":
         pit_simulations=args.pit_simulations,
         promote_threshold=args.promote_threshold,
         max_positions=args.max_positions,
+        force_promote=args.force_promote,
     )
