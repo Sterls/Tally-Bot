@@ -1,5 +1,6 @@
 import math
 import os
+import threading
 import numpy as np
 import torch
 import chess
@@ -12,6 +13,7 @@ from engine.search import evaluate as static_eval
 MAX_MOVES = 200
 TEMP_THRESHOLD = 20  # sample proportionally for first N moves, then argmax
 STATIC_EVAL_SCALE = 600  # centipawns; tanh(600cp/600) ≈ 0.76 for a queen-up position
+N_WORKERS = 4  # parallel self-play games
 
 
 def play_game(model, n_simulations: int = 50) -> tuple:
@@ -83,17 +85,38 @@ def play_game_vs(model_white, model_black, n_simulations: int = 25) -> float:
 
 
 def generate(n_games: int, output_path: str, model, n_simulations: int = 50):
-    """Play n_games self-play games and save dataset."""
+    """Play n_games self-play games in parallel and save dataset."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    all_tensors, all_policies, all_outcomes = [], [], []
+    game_counter = [0]
+    all_results = []
+    lock = threading.Lock()
 
-    for i in range(n_games):
-        tensors, policies, outcome = play_game(model, n_simulations)
+    def worker():
+        while True:
+            with lock:
+                if game_counter[0] >= n_games:
+                    return
+                game_counter[0] += 1
+
+            tensors, policies, outcome = play_game(model, n_simulations)
+
+            with lock:
+                all_results.append((tensors, policies, outcome))
+                n = len(all_results)
+                print(f"  game {n}/{n_games}  moves={len(tensors)}  outcome={outcome:+.3f}")
+
+    threads = [threading.Thread(target=worker) for _ in range(N_WORKERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    all_tensors, all_policies, all_outcomes = [], [], []
+    for tensors, policies, outcome in all_results:
         all_tensors.extend(tensors)
         all_policies.extend(policies)
         all_outcomes.extend([outcome] * len(tensors))
-        print(f"  game {i + 1}/{n_games}  moves={len(tensors)}  outcome={outcome:+.3f}")
 
     dataset = {
         "tensors": torch.tensor(np.array(all_tensors), dtype=torch.uint8),

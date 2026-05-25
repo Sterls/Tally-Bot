@@ -10,6 +10,7 @@ from engine.moves import legal_policy
 C_PUCT = 1.5
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPS = 0.25
+BATCH_SIZE = 8  # leaf nodes to evaluate per GPU call
 
 
 class MCTSNode:
@@ -37,10 +38,6 @@ class MCTSNode:
 
 
 def _infer(board: chess.Board, model) -> tuple:
-    """
-    Run the network. Returns (value, policy) where value is from the
-    current player's perspective (+1 = current player wins).
-    """
     device = next(model.parameters()).device
     x = torch.from_numpy(board_to_tensor(board)).unsqueeze(0).float().to(device)
     with torch.no_grad():
@@ -51,11 +48,63 @@ def _infer(board: chess.Board, model) -> tuple:
     return v, legal_policy(board, logits.squeeze(0))
 
 
+def _infer_batch(boards: list, model) -> list:
+    """Evaluate multiple boards in one forward pass. Returns list of (value, policy)."""
+    device = next(model.parameters()).device
+    xs = torch.stack([
+        torch.from_numpy(board_to_tensor(b)).float()
+        for b in boards
+    ]).to(device)
+    with torch.no_grad():
+        values, logits = model(xs)
+    results = []
+    for i, board in enumerate(boards):
+        v = values[i].item()
+        if board.turn == chess.BLACK:
+            v = -v
+        results.append((v, legal_policy(board, logits[i])))
+    return results
+
+
 def _terminal_value(board: chess.Board) -> float:
     """Value from the current player's perspective at a terminal position."""
     if board.is_checkmate():
         return -1.0  # player to move was checkmated
     return 0.0       # stalemate / other draw
+
+
+def _select_and_apply_virtual_loss(root, board):
+    """
+    Tree selection from root. Applies virtual loss (N+=1, W-=1) along the path
+    so that subsequent selections in the same batch avoid this path.
+    Returns (path, sim_board).
+    """
+    node = root
+    sim_board = board.copy(stack=False)
+    path = [node]
+
+    while node.expanded and not sim_board.is_game_over():
+        node = node.best_child()
+        sim_board.push(node.move)
+        path.append(node)
+
+    for n in path:
+        n.N += 1
+        n.W -= 1
+
+    return path, sim_board
+
+
+def _backup(path, leaf_v):
+    """
+    Undo virtual loss and backup leaf_v up the path.
+    leaf_v is from the leaf node's current-player perspective.
+    Net effect: N stays +1 (from virtual loss), W += leaf_v (alternating sign).
+    """
+    v = leaf_v
+    for n in reversed(path):
+        n.W += 1 + v  # undo VL (-1) and add real value
+        v = -v
 
 
 def search(
@@ -66,7 +115,7 @@ def search(
 ) -> dict:
     """
     Run MCTS from board. Returns {move: visit_probability} over legal moves.
-    All values in the tree are from each node's current-player perspective.
+    Evaluates BATCH_SIZE leaf nodes per GPU call using virtual loss.
     """
     if board.is_game_over():
         return {}
@@ -88,32 +137,33 @@ def search(
     root.N = 1
     root.W = v
 
-    for _ in range(n_simulations - 1):
-        node = root
-        sim_board = board.copy(stack=False)
-        path = [node]
+    sims_done = 1
+    while sims_done < n_simulations:
+        batch = min(BATCH_SIZE, n_simulations - sims_done)
 
-        # Selection
-        while node.expanded and not sim_board.is_game_over():
-            node = node.best_child()
-            sim_board.push(node.move)
-            path.append(node)
+        nonterminal = []  # (path, sim_board)
+        terminal = []     # (path, terminal_v)
 
-        # Expansion / evaluation
-        if sim_board.is_game_over():
-            leaf_v = _terminal_value(sim_board)
-        else:
-            leaf_v, child_policy = _infer(sim_board, model)
-            for move, prior in child_policy.items():
-                node.children[move] = MCTSNode(parent=node, move=move, prior=prior)
-            node.expanded = True
+        for _ in range(batch):
+            path, sim_board = _select_and_apply_virtual_loss(root, board)
+            if sim_board.is_game_over():
+                terminal.append((path, _terminal_value(sim_board)))
+            else:
+                nonterminal.append((path, sim_board))
 
-        # Backup — alternate sign going up (parent is the opponent)
-        v = leaf_v
-        for n in reversed(path):
-            n.N += 1
-            n.W += v
-            v = -v
+        if nonterminal:
+            inferred = _infer_batch([b for _, b in nonterminal], model)
+            for (path, _), (leaf_v, child_policy) in zip(nonterminal, inferred):
+                node = path[-1]
+                for move, prior in child_policy.items():
+                    node.children[move] = MCTSNode(parent=node, move=move, prior=prior)
+                node.expanded = True
+                _backup(path, leaf_v)
+
+        for path, leaf_v in terminal:
+            _backup(path, leaf_v)
+
+        sims_done += batch
 
     total = sum(c.N for c in root.children.values())
     if total == 0:
@@ -144,29 +194,31 @@ def best_move_timed(board: chess.Board, model, think_ms: int):
     deadline = time.monotonic() + think_ms / 1000
     sims = 0
     while time.monotonic() < deadline:
-        node = root
-        sim_board = board.copy(stack=False)
-        path = [node]
+        nonterminal = []
+        terminal = []
 
-        while node.expanded and not sim_board.is_game_over():
-            node = node.best_child()
-            sim_board.push(node.move)
-            path.append(node)
+        for _ in range(BATCH_SIZE):
+            if time.monotonic() >= deadline:
+                break
+            path, sim_board = _select_and_apply_virtual_loss(root, board)
+            if sim_board.is_game_over():
+                terminal.append((path, _terminal_value(sim_board)))
+            else:
+                nonterminal.append((path, sim_board))
 
-        if sim_board.is_game_over():
-            leaf_v = _terminal_value(sim_board)
-        else:
-            leaf_v, child_policy = _infer(sim_board, model)
-            for move, prior in child_policy.items():
-                node.children[move] = MCTSNode(parent=node, move=move, prior=prior)
-            node.expanded = True
+        if nonterminal:
+            inferred = _infer_batch([b for _, b in nonterminal], model)
+            for (path, _), (leaf_v, child_policy) in zip(nonterminal, inferred):
+                node = path[-1]
+                for move, prior in child_policy.items():
+                    node.children[move] = MCTSNode(parent=node, move=move, prior=prior)
+                node.expanded = True
+                _backup(path, leaf_v)
 
-        v = leaf_v
-        for n in reversed(path):
-            n.N += 1
-            n.W += v
-            v = -v
-        sims += 1
+        for path, leaf_v in terminal:
+            _backup(path, leaf_v)
+
+        sims += len(nonterminal) + len(terminal)
 
     print(f"  [{sims} sims in {think_ms}ms]")
     if not root.children:
