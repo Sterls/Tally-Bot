@@ -41,7 +41,8 @@ def _infer(board: chess.Board, model) -> tuple:
     Run the network. Returns (value, policy) where value is from the
     current player's perspective (+1 = current player wins).
     """
-    x = torch.from_numpy(board_to_tensor(board)).unsqueeze(0).float()
+    device = next(model.parameters()).device
+    x = torch.from_numpy(board_to_tensor(board)).unsqueeze(0).float().to(device)
     with torch.no_grad():
         value, logits = model(x)
     v = value.item()
