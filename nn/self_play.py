@@ -126,31 +126,16 @@ def _play_game_color(model, n_simulations, engine_depth, nn_is_white):
             break
 
         if board.turn == chess.BLACK:
-            # NN's turn — mirror the board so NN evaluates from white's view
-            mirrored = board.mirror()
-            policy_mirrored = mcts.search(mirrored, model, n_simulations, add_noise=True)
-            if not policy_mirrored:
+            # NN's turn — evaluate on real board; _infer handles color sign flip
+            policy = mcts.search(board, model, n_simulations, add_noise=True)
+            if not policy:
                 break
 
             tensors.append(board_to_tensor(board))
-            # Mirror policy moves back to real board coordinates
-            real_policy = {
-                chess.Move(chess.square_mirror(m.from_square),
-                           chess.square_mirror(m.to_square),
-                           m.promotion): p
-                for m, p in policy_mirrored.items()
-            }
-            # Filter to legal moves only
-            legal = set(board.legal_moves)
-            real_policy = {m: p for m, p in real_policy.items() if m in legal}
-            if not real_policy:
-                break
-            total = sum(real_policy.values())
-            real_policy = {m: p / total for m, p in real_policy.items()}
-            policy_targets.append(policy_to_tensor(real_policy))
+            policy_targets.append(policy_to_tensor(policy))
 
-            moves = list(real_policy.keys())
-            probs = np.array([real_policy[m] for m in moves], dtype=np.float64)
+            moves = list(policy.keys())
+            probs = np.array([policy[m] for m in moves], dtype=np.float64)
             probs /= probs.sum()
             move = (
                 moves[np.random.choice(len(moves), p=probs)]

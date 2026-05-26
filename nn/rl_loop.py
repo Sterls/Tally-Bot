@@ -11,7 +11,8 @@ from nn import storage
 CHECKPOINT_DIR = "nn/checkpoints"
 DATA_DIR = "nn/data"
 BEST_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "best.pt")
-DEPTH_STATE_FILE = os.path.join(CHECKPOINT_DIR, "engine_depth.txt")
+DEPTH_STATE_FILE    = os.path.join(CHECKPOINT_DIR, "engine_depth.txt")
+WIN_RATE_STATE_FILE = os.path.join(CHECKPOINT_DIR, "best_win_rate.txt")
 
 
 def pit_vs_engine(model, n_games: int = 10, n_simulations: int = 15,
@@ -79,6 +80,20 @@ def _save_depth(depth: int):
         f.write(str(depth))
 
 
+def _load_best_win_rate() -> float:
+    if os.path.exists(WIN_RATE_STATE_FILE):
+        with open(WIN_RATE_STATE_FILE) as f:
+            rate = float(f.read().strip())
+        print(f"Best win rate so far: {rate:.2f}")
+        return rate
+    return -1.0  # any result promotes on first run
+
+
+def _save_best_win_rate(rate: float):
+    with open(WIN_RATE_STATE_FILE, "w") as f:
+        f.write(str(rate))
+
+
 def run(
     generations: int = 10,
     games_per_gen: int = 200,
@@ -89,9 +104,7 @@ def run(
     engine_depth: int = 1,
     max_engine_depth: int = 5,
     depth_advance_threshold: float = 0.60,
-    promote_threshold: float = 0.55,
     max_positions: int = 200_000,
-    force_promote: bool = False,
 ):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -102,6 +115,7 @@ def run(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     current_depth = _load_depth(engine_depth)
+    best_win_rate = _load_best_win_rate()
 
     existing_gens = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "gen*.pt")))
     start_gen = len(existing_gens)
@@ -151,15 +165,17 @@ def run(
             print("  Auto-promoting (pit disabled)")
         else:
             win_rate = pit_vs_engine(new_model, pit_games, pit_simulations, current_depth)
-            promote = force_promote or win_rate >= promote_threshold
+            promote = win_rate >= best_win_rate
 
-        # 5. Promote
+        # 5. Promote if new record against engine
         if promote:
             torch.save(new_model.state_dict(), BEST_CHECKPOINT)
             current_model = new_model
-            print(f"  Promoted gen{gen:03d} → best.pt")
+            best_win_rate = win_rate
+            _save_best_win_rate(best_win_rate)
+            print(f"  Promoted gen{gen:03d} → best.pt  (new best: {best_win_rate:.2f})")
         else:
-            print(f"  Not promoted — keeping previous best")
+            print(f"  Not promoted — best win rate still {best_win_rate:.2f}")
 
         # 6. Advance engine depth if NN is winning consistently
         if (win_rate is not None
@@ -190,9 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--engine-depth",           type=int,   default=1)
     parser.add_argument("--max-engine-depth",       type=int,   default=5)
     parser.add_argument("--depth-advance-threshold",type=float, default=0.60)
-    parser.add_argument("--promote-threshold",      type=float, default=0.55)
     parser.add_argument("--max-positions",          type=int,   default=200_000)
-    parser.add_argument("--force-promote",          action="store_true")
     args = parser.parse_args()
 
     run(
@@ -205,7 +219,5 @@ if __name__ == "__main__":
         engine_depth=args.engine_depth,
         max_engine_depth=args.max_engine_depth,
         depth_advance_threshold=args.depth_advance_threshold,
-        promote_threshold=args.promote_threshold,
         max_positions=args.max_positions,
-        force_promote=args.force_promote,
     )

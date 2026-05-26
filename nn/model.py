@@ -30,9 +30,9 @@ class ChessNet(nn.Module):
         )
 
         self.policy_head = nn.Sequential(
-            nn.Conv2d(128, 2, 1),
+            nn.Conv2d(128, 4, 1),
             nn.Flatten(),
-            nn.Linear(128, POLICY_SIZE),
+            nn.Linear(256, POLICY_SIZE),
         )
 
     def forward(self, x: torch.Tensor):

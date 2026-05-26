@@ -74,7 +74,7 @@ def train(
             log_probs = F.log_softmax(policy_logits, dim=-1)
             p_loss = -(policy_target * log_probs).sum(dim=-1).mean()
 
-            (v_loss + p_loss).backward()
+            (5 * v_loss + p_loss).backward()
             optimizer.step()
 
             n = len(outcome)
